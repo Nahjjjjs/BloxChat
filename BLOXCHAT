@@ -1,0 +1,909 @@
+-- BloxChat v2.0
+-- Live Dex Explorer tree + Remote Spy feed piped to AI
+-- Delta/sUNC | Discord theme | free models
+
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
+local HttpService    = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer    = Players.LocalPlayer
+
+-- ══════════════════════════════════════════════
+-- DESTROY OLD
+-- ══════════════════════════════════════════════
+if _G.BloxChatGui then pcall(function() _G.BloxChatGui:Destroy() end) end
+if _G.BloxChatRemoteSpy then
+    pcall(function() _G.BloxChatRemoteSpy.stop() end)
+end
+
+-- ══════════════════════════════════════════════
+-- CONFIG
+-- ══════════════════════════════════════════════
+local CONFIG = {
+    provider       = "pollinations",
+    model          = "openai",
+    apiKey         = "",
+    maxRemoteLogs  = 30,   -- rolling buffer
+    maxDexDepth    = 4,    -- instance tree depth
+    maxDexChildren = 8,    -- children per node
+    autoAnalyze    = true, -- auto-send remote logs to AI after N fires
+
+    systemPrompt = [[You are BloxChat — an AI assistant embedded in Roblox via Delta executor (sUNC supported).
+
+You have LIVE ACCESS to:
+1. DEX EXPLORER — real-time Roblox instance tree snapshots the user sends you
+2. REMOTE SPY    — live log of FireServer / InvokeServer calls with args
+
+When you receive a [DEX SNAPSHOT] block, analyse the instance tree and tell the user what you notice (services, scripts, remotes, interesting objects).
+When you receive a [REMOTE SPY LOG] block, analyse the remote calls — identify what they do, reconstruct likely server-side logic, suggest exploit scripts using FireServer/InvokeServer, and flag suspicious patterns.
+
+sUNC environment available: hookfunction, hookmetamethod, newcclosure, getnamecallmethod, setnamecallmethod,
+getrawmetatable, setreadonly, getnilinstances, getgc, getgenv, getrenv, getsenv, islclosure, iscclosure,
+isexecutorclosure, clonefunction, getupvalues, setupvalue, getconstants, setconstant, getprotos,
+getscriptbytecode, decompile, saveinstance, fireclickdetector, firetouchinterest, fireproximityprompt.
+
+Always write executor-compatible Lua. Use task.wait() not wait(). Wrap risky calls in pcall.
+Be concise, technical, and ship working code.]],
+
+    providers = {
+        {id="pollinations",   name="Pollinations ✓",   baseUrl="https://text.pollinations.ai/openai",                         models={"openai","mistral","llama"},                             noKey=true},
+        {id="llm7",           name="LLM7 ✓",           baseUrl="https://api.llm7.io/v1",                                      models={"gpt-4o-mini","deepseek-r1","qwen2.5-72b"},             noKey=true},
+        {id="openrouter",     name="OpenRouter ✓",     baseUrl="https://openrouter.ai/api/v1",                                models={"meta-llama/llama-3.2-3b-instruct:free","deepseek/deepseek-r1:free","mistralai/mistral-7b-instruct:free"}, noKey=true},
+        {id="groq",           name="Groq (key)",       baseUrl="https://api.groq.com/openai/v1",                              models={"llama-3.3-70b-versatile","deepseek-r1-distill-llama-70b","gemma2-9b-it"}, noKey=false},
+        {id="gemini",         name="Gemini (key)",     baseUrl="https://generativelanguage.googleapis.com/v1beta/openai",     models={"gemini-2.5-flash","gemini-2.0-flash","gemini-1.5-pro"}, noKey=false},
+        {id="deepseek",       name="DeepSeek (key)",   baseUrl="https://api.deepseek.com/v1",                                 models={"deepseek-chat","deepseek-reasoner"},                    noKey=false},
+    },
+}
+
+local currentProviderIdx = 1
+local currentModelIdx    = 1
+local function providerByIdx(i) return CONFIG.providers[i] end
+local function getProvider() return providerByIdx(currentProviderIdx) end
+local function getModel()
+    local p = getProvider()
+    return p.models[math.min(currentModelIdx,#p.models)]
+end
+
+-- ══════════════════════════════════════════════
+-- REMOTE SPY STATE
+-- ══════════════════════════════════════════════
+local remoteLogs   = {}   -- rolling buffer of captured remotes
+local spyActive    = false
+local originalNC   = nil  -- saved __namecall
+local originalFS   = nil
+local originalIS   = nil
+local remoteEvent_hook  = Instance.new("RemoteEvent")
+local remoteFunc_hook   = Instance.new("RemoteFunction")
+
+-- ══════════════════════════════════════════════
+-- DEX TREE HELPER
+-- ══════════════════════════════════════════════
+local function getInstancePath(obj)
+    local path = ""
+    local cur  = obj
+    local steps = 0
+    while cur and cur ~= game and steps < 10 do
+        local name = cur.Name:gsub("[^%w_]","_")
+        path = "."..name..path
+        cur  = cur.Parent
+        steps = steps + 1
+    end
+    return "game"..path
+end
+
+local function serializeValue(v)
+    local t = typeof(v)
+    if t == "Instance"  then return "<"..v.ClassName..": "..v.Name..">" end
+    if t == "string"    then return '"'..tostring(v):sub(1,60)..'"' end
+    if t == "number"    then return tostring(v) end
+    if t == "boolean"   then return tostring(v) end
+    if t == "Vector3"   then return string.format("Vector3(%.2f,%.2f,%.2f)",v.X,v.Y,v.Z) end
+    if t == "CFrame"    then return string.format("CFrame(%.2f,%.2f,%.2f)",v.Position.X,v.Position.Y,v.Position.Z) end
+    if t == "table"     then return "{table}" end
+    return "<"..t..">" 
+end
+
+local function serializeArgs(args)
+    local parts = {}
+    for i,v in ipairs(args) do
+        parts[i] = serializeValue(v)
+    end
+    return "("..table.concat(parts,", ")..")"
+end
+
+local function buildDexTree(root, depth, maxDepth, maxChildren)
+    if depth > maxDepth then return "" end
+    local indent = string.rep("  ", depth)
+    local result = indent.."["..root.ClassName.."] "..root.Name.."\n"
+    local children = root:GetChildren()
+    local count = math.min(#children, maxChildren)
+    for i = 1, count do
+        result = result .. buildDexTree(children[i], depth+1, maxDepth, maxChildren)
+    end
+    if #children > maxChildren then
+        result = result..indent.."  ... and "..(#children-maxChildren).." more\n"
+    end
+    return result
+end
+
+local function snapshotDex(target)
+    -- target: Instance or service name string or nil (= game)
+    local root = game
+    if type(target) == "string" then
+        local ok, svc = pcall(function() return game:GetService(target) end)
+        if ok and svc then root = svc
+        else
+            local found = game:FindFirstChild(target, true)
+            if found then root = found end
+        end
+    elseif typeof(target) == "Instance" then
+        root = target
+    end
+
+    local tree = buildDexTree(root, 0, CONFIG.maxDexDepth, CONFIG.maxDexChildren)
+    return string.format("[DEX SNAPSHOT] Path: %s\n```\n%s```", getInstancePath(root), tree)
+end
+
+local function formatRemoteLogs(logs, limit)
+    local lines = {"[REMOTE SPY LOG] Last "..#logs.." remote calls:"}
+    local start = math.max(1, #logs - (limit or 20) + 1)
+    for i = start, #logs do
+        local l = logs[i]
+        lines[#lines+1] = string.format(
+            "[%s] %s::%s%s → %s",
+            l.time, l.path, l.method, l.args,
+            l.returnVal ~= "" and ("return "..l.returnVal) or "void"
+        )
+    end
+    return table.concat(lines, "\n")
+end
+
+-- ══════════════════════════════════════════════
+-- HTTP / AI
+-- ══════════════════════════════════════════════
+local request = (syn and syn.request) or (http and http.request) or
+                http_request or (fluxus and fluxus.request) or request
+
+local history = {}
+
+local function callAI(userMsg, callback)
+    local p   = getProvider()
+    local mdl = getModel()
+    local key = CONFIG.apiKey
+
+    local msgs = {{role="system", content=CONFIG.systemPrompt}}
+    -- keep last 20 history entries
+    local hStart = math.max(1, #history-19)
+    for i = hStart, #history do
+        table.insert(msgs, {role=history[i].role, content=history[i].content})
+    end
+    table.insert(msgs, {role="user", content=userMsg})
+
+    local body = HttpService:JSONEncode({
+        model      = mdl,
+        messages   = msgs,
+        max_tokens = 1200,
+    })
+    local headers = {["Content-Type"]="application/json"}
+    if key and key ~= "" then headers["Authorization"] = "Bearer "..key end
+
+    local url = p.baseUrl.."/chat/completions"
+    if p.id == "gemini" and key ~= "" then
+        url = url.."?key="..key
+        headers["Authorization"] = nil
+    end
+
+    task.spawn(function()
+        local ok, res = pcall(request,{Url=url,Method="POST",Headers=headers,Body=body})
+        if not ok then callback(nil,"request() failed: "..tostring(res)) return end
+        if res.StatusCode ~= 200 then callback(nil,"HTTP "..res.StatusCode..": "..tostring(res.Body):sub(1,200)) return end
+        local ok2, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+        if not ok2 then callback(nil,"JSON decode failed") return end
+        local content = data.choices and data.choices[1] and
+                        data.choices[1].message and data.choices[1].message.content
+        if not content then callback(nil,"No content") return end
+        callback(content, nil)
+    end)
+end
+
+-- ══════════════════════════════════════════════
+-- COLORS
+-- ══════════════════════════════════════════════
+local C = {
+    BG        = Color3.fromRGB(49,  51,  56),
+    TOPBAR    = Color3.fromRGB(43,  45,  49),
+    INPUT_BG  = Color3.fromRGB(64,  68,  75),
+    MSG_USER  = Color3.fromRGB(88, 101, 242),
+    MSG_AI    = Color3.fromRGB(57,  59,  65),
+    MSG_SYS   = Color3.fromRGB(38,  40,  44),
+    TEXT      = Color3.fromRGB(220, 221, 222),
+    TEXT_DIM  = Color3.fromRGB(148, 155, 164),
+    ACCENT    = Color3.fromRGB(88, 101, 242),
+    GREEN     = Color3.fromRGB(87, 242, 135),
+    RED       = Color3.fromRGB(237, 66,  69),
+    ORANGE    = Color3.fromRGB(250,166, 26),
+    PURPLE    = Color3.fromRGB(155, 89, 182),
+    SETTINGS  = Color3.fromRGB(32,  34,  37),
+    SCROLL    = Color3.fromRGB(30,  31,  34),
+    WHITE     = Color3.fromRGB(255,255,255),
+}
+
+-- ══════════════════════════════════════════════
+-- BUILD SCREENUI
+-- ══════════════════════════════════════════════
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name            = "BloxChatGUI"
+ScreenGui.ResetOnSpawn    = false
+ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset  = true
+if syn and syn.protect_gui then
+    syn.protect_gui(ScreenGui)
+    ScreenGui.Parent = game:GetService("CoreGui")
+elseif gethui then
+    ScreenGui.Parent = gethui()
+else
+    ScreenGui.Parent = game:GetService("CoreGui")
+end
+_G.BloxChatGui = ScreenGui
+
+-- ── MAIN WINDOW ────────────────────────────────
+local Main = Instance.new("Frame")
+Main.Name              = "Main"
+Main.Size              = UDim2.new(0, 560, 0, 440)
+Main.Position          = UDim2.new(0.5,-280,0.5,-220)
+Main.BackgroundColor3  = C.BG
+Main.BorderSizePixel   = 0
+Main.Active            = true
+Main.Draggable         = true
+Main.ClipsDescendants  = true
+Main.Parent            = ScreenGui
+Instance.new("UICorner",Main).CornerRadius = UDim.new(0,8)
+
+local Shadow = Instance.new("ImageLabel")
+Shadow.Size = UDim2.new(1,30,1,30); Shadow.Position = UDim2.new(0,-15,0,-15)
+Shadow.BackgroundTransparency=1; Shadow.Image="rbxassetid://1316045217"
+Shadow.ImageColor3=Color3.new(0,0,0); Shadow.ImageTransparency=0.5
+Shadow.ScaleType=Enum.ScaleType.Slice; Shadow.SliceCenter=Rect.new(10,10,118,118)
+Shadow.ZIndex=-1; Shadow.Parent=Main
+
+-- ── TOP BAR ────────────────────────────────────
+local TopBar = Instance.new("Frame")
+TopBar.Name="TopBar"; TopBar.Size=UDim2.new(1,0,0,40)
+TopBar.BackgroundColor3=C.TOPBAR; TopBar.BorderSizePixel=0
+TopBar.Parent=Main
+
+local function topBtn(text, color, posX, w)
+    local b = Instance.new("TextButton")
+    b.Size=UDim2.new(0,w or 28,0,28); b.Position=UDim2.new(1,posX,0,6)
+    b.BackgroundColor3=color; b.BorderSizePixel=0
+    b.Text=text; b.TextColor3=C.WHITE; b.TextSize=13; b.Font=Enum.Font.GothamBold
+    b.Parent=TopBar
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    return b
+end
+
+local TopTitle = Instance.new("TextLabel")
+TopTitle.Size=UDim2.new(0,160,1,0); TopTitle.Position=UDim2.new(0,12,0,0)
+TopTitle.BackgroundTransparency=1; TopTitle.Font=Enum.Font.GothamBold
+TopTitle.Text="# bloxchat"; TopTitle.TextColor3=C.TEXT; TopTitle.TextSize=15
+TopTitle.TextXAlignment=Enum.TextXAlignment.Left; TopTitle.Parent=TopBar
+
+local ModelBadge = Instance.new("TextLabel")
+ModelBadge.Name="ModelBadge"; ModelBadge.Size=UDim2.new(0,140,0,22)
+ModelBadge.Position=UDim2.new(0,155,0,9); ModelBadge.BackgroundColor3=C.INPUT_BG
+ModelBadge.BorderSizePixel=0; ModelBadge.Font=Enum.Font.Gotham
+ModelBadge.TextColor3=C.TEXT_DIM; ModelBadge.TextSize=10
+ModelBadge.TextTruncate=Enum.TextTruncate.AtEnd; ModelBadge.Parent=TopBar
+Instance.new("UICorner",ModelBadge).CornerRadius=UDim.new(0,4)
+local mbp = Instance.new("UIPadding",ModelBadge); mbp.PaddingLeft=UDim.new(0,6); mbp.PaddingRight=UDim.new(0,4)
+
+local SpyBtn      = topBtn("🔴 Spy OFF", C.INPUT_BG, -248, 80)
+local DexBtn      = topBtn("🌲 Dex",     C.INPUT_BG, -164, 52)
+local SettingsBtn = topBtn("⚙",          C.INPUT_BG, -108, 28)
+local ClearBtn    = topBtn("🗑",          C.INPUT_BG, -76,  28)
+local MinBtn      = topBtn("─",          C.INPUT_BG, -44,  28)
+local CloseBtn    = topBtn("✕",          C.RED,      -12,  28)
+
+Instance.new("Frame",TopBar).Size=UDim2.new(1,0,0,1)  -- divider handled by Divider below
+
+local Divider = Instance.new("Frame")
+Divider.Size=UDim2.new(1,0,0,1); Divider.Position=UDim2.new(0,0,1,0)
+Divider.BackgroundColor3=Color3.fromRGB(30,31,34); Divider.BorderSizePixel=0
+Divider.Parent=TopBar
+
+-- ── CHAT SCROLL ────────────────────────────────
+local ChatScroll = Instance.new("ScrollingFrame")
+ChatScroll.Name="ChatScroll"; ChatScroll.Size=UDim2.new(1,0,1,-108)
+ChatScroll.Position=UDim2.new(0,0,0,41)
+ChatScroll.BackgroundTransparency=1; ChatScroll.BorderSizePixel=0
+ChatScroll.ScrollBarThickness=4; ChatScroll.ScrollBarImageColor3=C.SCROLL
+ChatScroll.CanvasSize=UDim2.new(0,0,0,0)
+ChatScroll.AutomaticCanvasSize=Enum.AutomaticCanvasSize.Y
+ChatScroll.Parent=Main
+
+local MsgList = Instance.new("UIListLayout",ChatScroll)
+MsgList.SortOrder=Enum.SortOrder.LayoutOrder; MsgList.Padding=UDim.new(0,3)
+
+local MsgPad = Instance.new("UIPadding",ChatScroll)
+MsgPad.PaddingTop=UDim.new(0,8); MsgPad.PaddingBottom=UDim.new(0,8)
+MsgPad.PaddingLeft=UDim.new(0,8); MsgPad.PaddingRight=UDim.new(0,8)
+
+-- ── TOOL BAR (spy controls) ────────────────────
+local ToolBar = Instance.new("Frame")
+ToolBar.Name="ToolBar"; ToolBar.Size=UDim2.new(1,0,0,26)
+ToolBar.Position=UDim2.new(0,0,1,-106)
+ToolBar.BackgroundColor3=Color3.fromRGB(36,37,42); ToolBar.BorderSizePixel=0
+ToolBar.Parent=Main
+
+local SpyStatus = Instance.new("TextLabel")
+SpyStatus.Size=UDim2.new(1,-200,1,0); SpyStatus.Position=UDim2.new(0,8,0,0)
+SpyStatus.BackgroundTransparency=1; SpyStatus.Font=Enum.Font.Gotham
+SpyStatus.Text="Remote Spy: OFF  |  Remotes captured: 0"
+SpyStatus.TextColor3=C.TEXT_DIM; SpyStatus.TextSize=10
+SpyStatus.TextXAlignment=Enum.TextXAlignment.Left; SpyStatus.Parent=ToolBar
+
+local AnalyzeBtn = Instance.new("TextButton")
+AnalyzeBtn.Size=UDim2.new(0,90,0,20); AnalyzeBtn.Position=UDim2.new(1,-194,0,3)
+AnalyzeBtn.BackgroundColor3=C.PURPLE; AnalyzeBtn.BorderSizePixel=0
+AnalyzeBtn.Font=Enum.Font.GothamBold; AnalyzeBtn.TextColor3=C.WHITE
+AnalyzeBtn.TextSize=11; AnalyzeBtn.Text="🔍 Analyze Remotes"
+AnalyzeBtn.Parent=ToolBar
+Instance.new("UICorner",AnalyzeBtn).CornerRadius=UDim.new(0,4)
+
+local ClearRemotesBtn = Instance.new("TextButton")
+ClearRemotesBtn.Size=UDim2.new(0,70,0,20); ClearRemotesBtn.Position=UDim2.new(1,-100,0,3)
+ClearRemotesBtn.BackgroundColor3=C.INPUT_BG; ClearRemotesBtn.BorderSizePixel=0
+ClearRemotesBtn.Font=Enum.Font.GothamBold; ClearRemotesBtn.TextColor3=C.TEXT_DIM
+ClearRemotesBtn.TextSize=11; ClearRemotesBtn.Text="🗑 Clear Spy"
+ClearRemotesBtn.Parent=ToolBar
+Instance.new("UICorner",ClearRemotesBtn).CornerRadius=UDim.new(0,4)
+
+local DexPanel = Instance.new("TextButton")
+DexPanel.Size=UDim2.new(0,24,0,20); DexPanel.Position=UDim2.new(1,-26,0,3)
+DexPanel.BackgroundColor3=C.INPUT_BG; DexPanel.BorderSizePixel=0
+DexPanel.Font=Enum.Font.GothamBold; DexPanel.TextColor3=C.TEXT_DIM
+DexPanel.TextSize=11; DexPanel.Text="?"
+DexPanel.Parent=ToolBar
+Instance.new("UICorner",DexPanel).CornerRadius=UDim.new(0,4)
+
+-- ── INPUT BAR ──────────────────────────────────
+local InputBar = Instance.new("Frame")
+InputBar.Name="InputBar"; InputBar.Size=UDim2.new(1,-16,0,44)
+InputBar.Position=UDim2.new(0,8,1,-56)
+InputBar.BackgroundColor3=C.INPUT_BG; InputBar.BorderSizePixel=0; InputBar.Parent=Main
+Instance.new("UICorner",InputBar).CornerRadius=UDim.new(0,8)
+
+local InputBox = Instance.new("TextBox")
+InputBox.Size=UDim2.new(1,-56,1,0); InputBox.Position=UDim2.new(0,12,0,0)
+InputBox.BackgroundTransparency=1; InputBox.Font=Enum.Font.Gotham
+InputBox.Text=""; InputBox.PlaceholderText="Ask AI, or type /dex <path> or /spy..."
+InputBox.PlaceholderColor3=C.TEXT_DIM; InputBox.TextColor3=C.TEXT
+InputBox.TextSize=13; InputBox.ClearTextOnFocus=false
+InputBox.TextXAlignment=Enum.TextXAlignment.Left; InputBox.Parent=InputBar
+
+local SendBtn = Instance.new("TextButton")
+SendBtn.Size=UDim2.new(0,36,0,36); SendBtn.Position=UDim2.new(1,-42,0,4)
+SendBtn.BackgroundColor3=C.ACCENT; SendBtn.BorderSizePixel=0
+SendBtn.Text="▶"; SendBtn.TextColor3=C.WHITE; SendBtn.TextSize=15
+SendBtn.Font=Enum.Font.GothamBold; SendBtn.Parent=InputBar
+Instance.new("UICorner",SendBtn).CornerRadius=UDim.new(0,6)
+
+local StatusBar = Instance.new("TextLabel")
+StatusBar.Size=UDim2.new(1,-16,0,16); StatusBar.Position=UDim2.new(0,8,1,-16)
+StatusBar.BackgroundTransparency=1; StatusBar.Font=Enum.Font.Gotham
+StatusBar.TextColor3=C.TEXT_DIM; StatusBar.TextSize=10
+StatusBar.TextXAlignment=Enum.TextXAlignment.Left; StatusBar.Parent=Main
+
+-- ══════════════════════════════════════════════
+-- SETTINGS PANEL
+-- ══════════════════════════════════════════════
+local SP = Instance.new("Frame")
+SP.Name="Settings"; SP.Size=UDim2.new(0,280,0,360)
+SP.Position=UDim2.new(1,4,0,0); SP.BackgroundColor3=C.SETTINGS
+SP.BorderSizePixel=0; SP.Visible=false; SP.Parent=Main
+Instance.new("UICorner",SP).CornerRadius=UDim.new(0,8)
+local SPPad=Instance.new("UIPadding",SP)
+SPPad.PaddingTop=UDim.new(0,10); SPPad.PaddingBottom=UDim.new(0,10)
+SPPad.PaddingLeft=UDim.new(0,12); SPPad.PaddingRight=UDim.new(0,12)
+local SPLayout=Instance.new("UIListLayout",SP)
+SPLayout.SortOrder=Enum.SortOrder.LayoutOrder; SPLayout.Padding=UDim.new(0,7)
+
+local function spLbl(txt, order, dim)
+    local l=Instance.new("TextLabel"); l.LayoutOrder=order
+    l.Size=UDim2.new(1,0,0,16); l.BackgroundTransparency=1
+    l.Font=dim and Enum.Font.Gotham or Enum.Font.GothamBold
+    l.Text=txt; l.TextColor3=dim and C.TEXT_DIM or C.TEXT
+    l.TextSize=dim and 10 or 12; l.TextXAlignment=Enum.TextXAlignment.Left
+    l.Parent=SP; return l
+end
+local function spTb(ph, order, h)
+    local f=Instance.new("Frame"); f.LayoutOrder=order
+    f.Size=UDim2.new(1,0,0,h or 28); f.BackgroundColor3=C.INPUT_BG
+    f.BorderSizePixel=0; f.Parent=SP
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,6)
+    local p=Instance.new("UIPadding",f); p.PaddingLeft=UDim.new(0,6)
+    local tb=Instance.new("TextBox",f); tb.Size=UDim2.new(1,0,1,0)
+    tb.BackgroundTransparency=1; tb.Font=Enum.Font.Gotham; tb.TextSize=11
+    tb.TextColor3=C.TEXT; tb.PlaceholderColor3=C.TEXT_DIM
+    tb.PlaceholderText=ph; tb.Text=""; tb.ClearTextOnFocus=false
+    tb.TextXAlignment=Enum.TextXAlignment.Left; return tb
+end
+local function spCycleRow(lbl, order)
+    local f=Instance.new("Frame"); f.LayoutOrder=order
+    f.Size=UDim2.new(1,0,0,26); f.BackgroundColor3=C.INPUT_BG
+    f.BorderSizePixel=0; f.Parent=SP
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,6)
+    local prev=Instance.new("TextButton",f); prev.Size=UDim2.new(0,24,1,0)
+    prev.BackgroundTransparency=1; prev.Text="‹"; prev.TextColor3=C.TEXT
+    prev.Font=Enum.Font.GothamBold; prev.TextSize=16; prev.Name="Prev"
+    local disp=Instance.new("TextLabel",f); disp.Size=UDim2.new(1,-48,1,0)
+    disp.Position=UDim2.new(0,24,0,0); disp.BackgroundTransparency=1
+    disp.Font=Enum.Font.Gotham; disp.TextColor3=C.TEXT; disp.TextSize=11
+    disp.Text=lbl; disp.Name="Disp"; disp.TextTruncate=Enum.TextTruncate.AtEnd
+    local nxt=Instance.new("TextButton",f); nxt.Size=UDim2.new(0,24,1,0)
+    nxt.Position=UDim2.new(1,-24,0,0); nxt.BackgroundTransparency=1
+    nxt.Text="›"; nxt.TextColor3=C.TEXT; nxt.Font=Enum.Font.GothamBold
+    nxt.TextSize=16; nxt.Name="Next"
+    return f, disp, prev, nxt
+end
+local function spApplyBtn(txt, color, order)
+    local b=Instance.new("TextButton"); b.LayoutOrder=order
+    b.Size=UDim2.new(1,0,0,30); b.BackgroundColor3=color; b.BorderSizePixel=0
+    b.Font=Enum.Font.GothamBold; b.Text=txt; b.TextColor3=C.WHITE
+    b.TextSize=12; b.Parent=SP
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    return b
+end
+
+spLbl("⚙ Settings",1)
+spLbl("Provider",2)
+local ProvRow, ProvDisp, ProvPrev, ProvNext = spCycleRow("",3)
+spLbl("Model",4)
+local MdlRow,  MdlDisp,  MdlPrev,  MdlNext  = spCycleRow("",5)
+spLbl("API Key",6)
+local KeyTb = spTb("paste key (leave blank for no-key providers)",7)
+KeyTb.Text = CONFIG.apiKey
+spLbl("Dex Depth (1-6)",8)
+local DepthTb = spTb("4",9); DepthTb.Text=tostring(CONFIG.maxDexDepth)
+spLbl("Auto-analyze after N remotes (0=off)",10)
+local AutoTb = spTb("0",11); AutoTb.Text="0"
+local ApplyBtn  = spApplyBtn("✔ Apply",  C.ACCENT, 12)
+local FetchBtn  = spApplyBtn("🌐 Find Free Model APIs", C.PURPLE, 13)
+spLbl("Free: Pollinations,LLM7,OpenRouter,Kilo",14,true)
+spLbl("Key:  Groq•Gemini•DeepSeek•ZhipuAI",15,true)
+
+-- ══════════════════════════════════════════════
+-- UI STATE UPDATE
+-- ══════════════════════════════════════════════
+local function updateBadges()
+    ProvDisp.Text = getProvider().name
+    MdlDisp.Text  = getModel()
+    ModelBadge.Text = getModel()
+    StatusBar.Text  = getProvider().name.." → "..getModel()
+end
+
+ProvPrev.MouseButton1Click:Connect(function()
+    currentProviderIdx = ((currentProviderIdx-2)%#CONFIG.providers)+1
+    currentModelIdx=1; updateBadges()
+end)
+ProvNext.MouseButton1Click:Connect(function()
+    currentProviderIdx = (currentProviderIdx%#CONFIG.providers)+1
+    currentModelIdx=1; updateBadges()
+end)
+MdlPrev.MouseButton1Click:Connect(function()
+    local m=#getProvider().models
+    currentModelIdx=((currentModelIdx-2)%m)+1; updateBadges()
+end)
+MdlNext.MouseButton1Click:Connect(function()
+    local m=#getProvider().models
+    currentModelIdx=(currentModelIdx%m)+1; updateBadges()
+end)
+
+updateBadges()
+
+-- ══════════════════════════════════════════════
+-- MESSAGE RENDERER
+-- ══════════════════════════════════════════════
+local msgCount = 0
+local typing   = false
+
+local function scrollBottom()
+    task.wait()
+    ChatScroll.CanvasPosition = Vector2.new(0, ChatScroll.AbsoluteCanvasSize.Y + 9999)
+end
+
+local function addMessage(role, text)
+    msgCount = msgCount + 1
+    local isUser = role == "user"
+    local isSys  = role == "system"
+
+    local Row = Instance.new("Frame")
+    Row.LayoutOrder = msgCount; Row.Size=UDim2.new(1,0,0,0)
+    Row.AutomaticSize=Enum.AutomaticSize.Y; Row.BackgroundTransparency=1
+    Row.Parent=ChatScroll
+
+    local bubW = isSys and 1.0 or 0.82
+    local bubX = (isUser and not isSys) and (1-bubW) or 0
+
+    local Bubble = Instance.new("Frame")
+    Bubble.Size=UDim2.new(bubW,0,0,0); Bubble.Position=UDim2.new(bubX,0,0,0)
+    Bubble.AutomaticSize=Enum.AutomaticSize.Y
+    Bubble.BackgroundColor3 = isSys and C.MSG_SYS or (isUser and C.MSG_USER or C.MSG_AI)
+    Bubble.BorderSizePixel=0; Bubble.Parent=Row
+    Instance.new("UICorner",Bubble).CornerRadius=UDim.new(0,8)
+    local bp=Instance.new("UIPadding",Bubble)
+    bp.PaddingTop=UDim.new(0,6); bp.PaddingBottom=UDim.new(0,6)
+    bp.PaddingLeft=UDim.new(0,10); bp.PaddingRight=UDim.new(0,10)
+
+    local Sender = Instance.new("TextLabel")
+    Sender.Size=UDim2.new(1,0,0,13); Sender.BackgroundTransparency=1
+    Sender.Font=Enum.Font.GothamBold; Sender.TextSize=9
+    Sender.TextXAlignment=Enum.TextXAlignment.Left; Sender.Parent=Bubble
+    if isSys then
+        Sender.Text="🔧 SYSTEM"; Sender.TextColor3=C.ORANGE
+    elseif isUser then
+        Sender.Text=LocalPlayer.Name; Sender.TextColor3=Color3.fromRGB(255,255,255)
+    else
+        Sender.Text="BloxChat AI"; Sender.TextColor3=C.GREEN
+    end
+
+    local Msg = Instance.new("TextLabel")
+    Msg.Size=UDim2.new(1,0,0,0); Msg.Position=UDim2.new(0,0,0,14)
+    Msg.AutomaticSize=Enum.AutomaticSize.Y; Msg.BackgroundTransparency=1
+    Msg.Font=Enum.Font.Gotham; Msg.Text=text; Msg.TextColor3=C.TEXT
+    Msg.TextSize=12; Msg.TextWrapped=true
+    Msg.TextXAlignment=Enum.TextXAlignment.Left; Msg.Parent=Bubble
+
+    scrollBottom()
+    return Msg
+end
+
+local function addTypingIndicator()
+    msgCount=msgCount+1
+    local Row=Instance.new("Frame"); Row.LayoutOrder=msgCount
+    Row.Size=UDim2.new(1,0,0,34); Row.BackgroundTransparency=1; Row.Parent=ChatScroll
+    local Bub=Instance.new("Frame"); Bub.Size=UDim2.new(0.45,0,1,0)
+    Bub.BackgroundColor3=C.MSG_AI; Bub.BorderSizePixel=0; Bub.Parent=Row
+    Instance.new("UICorner",Bub).CornerRadius=UDim.new(0,8)
+    local Lbl=Instance.new("TextLabel",Bub); Lbl.Size=UDim2.new(1,0,1,0)
+    Lbl.BackgroundTransparency=1; Lbl.Font=Enum.Font.GothamBold
+    Lbl.TextColor3=C.TEXT_DIM; Lbl.TextSize=12; Lbl.Text="BloxChat is thinking..."
+    scrollBottom()
+    local dots=0; local running=true
+    local conn=RunService.Heartbeat:Connect(function()
+        if not running then return end
+        dots=(dots+1)%4; Lbl.Text="BloxChat is thinking"..string.rep(".",dots)
+    end)
+    return function() running=false; conn:Disconnect(); Row:Destroy() end
+end
+
+-- ══════════════════════════════════════════════
+-- AI SEND WITH HISTORY
+-- ══════════════════════════════════════════════
+local function sendToAI(userMsg, displayMsg, isAutomatic)
+    if typing then return end
+    typing=true
+    SendBtn.BackgroundColor3=Color3.fromRGB(60,60,60)
+
+    if not isAutomatic then
+        addMessage("user", displayMsg or userMsg)
+    end
+    table.insert(history, {role="user", content=userMsg})
+
+    local stopTyping = addTypingIndicator()
+
+    callAI(userMsg, function(reply, err)
+        stopTyping(); typing=false
+        SendBtn.BackgroundColor3=C.ACCENT
+        local msg = err and ("❌ Error: "..err) or reply
+        addMessage("assistant", msg)
+        table.insert(history, {role="assistant", content=msg})
+        if #history > 40 then
+            table.remove(history,1); table.remove(history,1)
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════
+-- REMOTE SPY ENGINE
+-- ══════════════════════════════════════════════
+local function logRemote(remotePath, method, args, retVal)
+    local entry = {
+        time      = os.date("%H:%M:%S"),
+        path      = remotePath,
+        method    = method,
+        args      = serializeArgs(args),
+        returnVal = retVal and serializeValue(retVal) or "",
+    }
+    table.insert(remoteLogs, entry)
+    if #remoteLogs > CONFIG.maxRemoteLogs then table.remove(remoteLogs,1) end
+
+    SpyStatus.Text = "Remote Spy: ON  |  Captured: "..#remoteLogs
+
+    -- Display in chat as a system message (compact)
+    local line = string.format("[SPY] %s::%s%s", remotePath, method, entry.args)
+    if entry.returnVal ~= "" then line = line.." → "..entry.returnVal end
+    addMessage("system", line)
+
+    -- Auto-analyze every N remotes if configured
+    local N = tonumber(AutoTb.Text) or 0
+    if N > 0 and #remoteLogs % N == 0 then
+        local logBlock = formatRemoteLogs(remoteLogs, N)
+        addMessage("system", "⚡ Auto-analyzing last "..N.." remotes...")
+        sendToAI(logBlock, nil, true)
+    end
+end
+
+local function startSpy()
+    if spyActive then return end
+    spyActive = true
+
+    local gm = getrawmetatable and getrawmetatable(game)
+    if not gm then
+        addMessage("system","❌ getrawmetatable not available — spy requires sUNC/Delta")
+        spyActive=false; return
+    end
+
+    local oldNC = gm.__namecall
+    originalNC  = oldNC
+
+    local newNC = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if method == "FireServer" or method == "fireServer" or
+           method == "InvokeServer" or method == "invokeServer" then
+            local ok, name = pcall(function() return self.Name end)
+            if ok then
+                local args = {...}
+                local path = pcall(getInstancePath, self) and getInstancePath(self) or self.Name
+                if method:lower():find("invoke") then
+                    local ret = {oldNC(self,...)}
+                    logRemote(path, method, args, ret[1])
+                    return unpack(ret)
+                else
+                    logRemote(path, method, args, nil)
+                end
+            end
+        end
+        return oldNC(self,...)
+    end, oldNC)
+
+    if setreadonly then setreadonly(gm, false) end
+    gm.__namecall = newNC
+    if setreadonly then setreadonly(gm, true) end
+
+    SpyBtn.Text = "🟢 Spy ON"
+    SpyBtn.BackgroundColor3 = Color3.fromRGB(50,80,50)
+    SpyStatus.Text = "Remote Spy: ON  |  Captured: "..#remoteLogs
+    addMessage("system", "✅ Remote Spy started — watching FireServer / InvokeServer calls")
+
+    _G.BloxChatRemoteSpy = {
+        stop = function()
+            if not spyActive then return end
+            spyActive = false
+            if setreadonly then setreadonly(gm,false) end
+            gm.__namecall = oldNC
+            if setreadonly then setreadonly(gm,true) end
+            SpyBtn.Text="🔴 Spy OFF"; SpyBtn.BackgroundColor3=C.INPUT_BG
+            SpyStatus.Text="Remote Spy: OFF  |  Captured: "..#remoteLogs
+        end
+    }
+end
+
+local function stopSpy()
+    if _G.BloxChatRemoteSpy then
+        pcall(_G.BloxChatRemoteSpy.stop)
+    end
+end
+
+-- ══════════════════════════════════════════════
+-- DEX PANEL (quick path picker)
+-- ══════════════════════════════════════════════
+local DexInputPanel = Instance.new("Frame")
+DexInputPanel.Name="DexInput"; DexInputPanel.Size=UDim2.new(0,240,0,44)
+DexInputPanel.Position=UDim2.new(0,8,1,-108)
+DexInputPanel.BackgroundColor3=Color3.fromRGB(36,37,42); DexInputPanel.BorderSizePixel=0
+DexInputPanel.Visible=false; DexInputPanel.Parent=Main
+Instance.new("UICorner",DexInputPanel).CornerRadius=UDim.new(0,6)
+local DexPadding=Instance.new("UIPadding",DexInputPanel)
+DexPadding.PaddingLeft=UDim.new(0,8); DexPadding.PaddingRight=UDim.new(0,8)
+DexPadding.PaddingTop=UDim.new(0,4); DexPadding.PaddingBottom=UDim.new(0,4)
+local DexLayout=Instance.new("UIListLayout",DexInputPanel)
+DexLayout.FillDirection=Enum.FillDirection.Horizontal; DexLayout.Padding=UDim.new(0,6)
+DexLayout.VerticalAlignment=Enum.VerticalAlignment.Center
+
+local DexPathBox=Instance.new("TextBox"); DexPathBox.Size=UDim2.new(0,150,0,26)
+DexPathBox.BackgroundColor3=C.INPUT_BG; DexPathBox.BorderSizePixel=0
+DexPathBox.Font=Enum.Font.Gotham; DexPathBox.TextSize=11; DexPathBox.TextColor3=C.TEXT
+DexPathBox.PlaceholderText="service or path..."; DexPathBox.PlaceholderColor3=C.TEXT_DIM
+DexPathBox.Text="Workspace"; DexPathBox.ClearTextOnFocus=false
+DexPathBox.Parent=DexInputPanel
+Instance.new("UICorner",DexPathBox).CornerRadius=UDim.new(0,4)
+
+local DexSnapBtn=Instance.new("TextButton"); DexSnapBtn.Size=UDim2.new(0,60,0,26)
+DexSnapBtn.BackgroundColor3=C.GREEN; DexSnapBtn.BorderSizePixel=0
+DexSnapBtn.Font=Enum.Font.GothamBold; DexSnapBtn.TextColor3=Color3.fromRGB(0,0,0)
+DexSnapBtn.TextSize=11; DexSnapBtn.Text="📸 Snap"; DexSnapBtn.Parent=DexInputPanel
+Instance.new("UICorner",DexSnapBtn).CornerRadius=UDim.new(0,4)
+
+-- ══════════════════════════════════════════════
+-- SLASH COMMAND PARSER
+-- ══════════════════════════════════════════════
+local function handleSlashCommand(raw)
+    local cmd, arg = raw:match("^/(%w+)%s*(.*)")
+    if not cmd then return false end
+    cmd = cmd:lower()
+
+    if cmd == "dex" then
+        local target = (arg and arg ~= "") and arg or "game"
+        local snap = snapshotDex(target)
+        addMessage("system", "📸 Dex snapshot: "..target)
+        sendToAI(snap, nil, true)
+        return true
+
+    elseif cmd == "spy" then
+        if not spyActive then startSpy() else stopSpy() end
+        return true
+
+    elseif cmd == "analyze" or cmd == "analyse" then
+        if #remoteLogs == 0 then
+            addMessage("system","⚠ No remote logs yet — enable spy first")
+        else
+            local block = formatRemoteLogs(remoteLogs, 30)
+            addMessage("system","🔍 Sending "..#remoteLogs.." remote logs to AI...")
+            sendToAI(block, nil, true)
+        end
+        return true
+
+    elseif cmd == "clear" then
+        history={}; remoteLogs={}; msgCount=0
+        for _,c in ipairs(ChatScroll:GetChildren()) do
+            if c:IsA("Frame") then c:Destroy() end
+        end
+        addMessage("system","🗑 Chat and remote logs cleared")
+        return true
+
+    elseif cmd == "help" then
+        addMessage("system",
+            "BloxChat Commands:\n"..
+            "/dex [path]    — snapshot instance tree\n"..
+            "/spy           — toggle remote spy\n"..
+            "/analyze       — send captured remotes to AI\n"..
+            "/clear         — clear chat + logs\n"..
+            "/help          — this message\n\n"..
+            "Or just chat normally — AI knows Dex/sUNC/Delta"
+        )
+        return true
+    end
+    return false
+end
+
+-- ══════════════════════════════════════════════
+-- SEND HANDLER
+-- ══════════════════════════════════════════════
+local function onSend()
+    local text = InputBox.Text:match("^%s*(.-)%s*$")
+    if text == "" then return end
+    InputBox.Text = ""
+
+    if handleSlashCommand(text) then return end
+    sendToAI(text, text, false)
+end
+
+SendBtn.MouseButton1Click:Connect(onSend)
+InputBox.FocusLost:Connect(function(enter) if enter then onSend() end end)
+
+-- ══════════════════════════════════════════════
+-- BUTTON HANDLERS
+-- ══════════════════════════════════════════════
+local spyOpen = false
+SpyBtn.MouseButton1Click:Connect(function()
+    if not spyActive then startSpy() else stopSpy() end
+end)
+
+local dexPanelOpen = false
+DexBtn.MouseButton1Click:Connect(function()
+    dexPanelOpen = not dexPanelOpen
+    DexInputPanel.Visible = dexPanelOpen
+end)
+
+DexSnapBtn.MouseButton1Click:Connect(function()
+    local path = DexPathBox.Text:match("^%s*(.-)%s*$")
+    if path == "" then path = "Workspace" end
+    local snap = snapshotDex(path)
+    addMessage("system","📸 Snapshot: "..path)
+    sendToAI(snap, nil, true)
+    dexPanelOpen=false; DexInputPanel.Visible=false
+end)
+
+AnalyzeBtn.MouseButton1Click:Connect(function()
+    if #remoteLogs==0 then
+        addMessage("system","⚠ No remote logs. Enable spy first.")
+        return
+    end
+    local block = formatRemoteLogs(remoteLogs, 30)
+    addMessage("system","🔍 Analyzing "..#remoteLogs.." captured remotes...")
+    sendToAI(block, nil, true)
+end)
+
+ClearRemotesBtn.MouseButton1Click:Connect(function()
+    remoteLogs={}
+    SpyStatus.Text="Remote Spy: "..(spyActive and "ON" or "OFF").."  |  Captured: 0"
+    addMessage("system","🗑 Remote log buffer cleared")
+end)
+
+DexPanel.MouseButton1Click:Connect(function()
+    addMessage("system",
+        "Quick DEX tips:\n"..
+        "• Click 🌲 Dex to open path input\n"..
+        "• Or type: /dex Workspace\n"..
+        "• Or type: /dex ReplicatedStorage\n"..
+        "• Any service name works\n"..
+        "• AI auto-analyses the tree"
+    )
+end)
+
+SettingsBtn.MouseButton1Click:Connect(function()
+    SP.Visible = not SP.Visible
+end)
+
+local minimized=false
+MinBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    ChatScroll.Visible=not minimized; ToolBar.Visible=not minimized
+    InputBar.Visible=not minimized; StatusBar.Visible=not minimized
+    DexInputPanel.Visible=false; SP.Visible=false
+    Main.Size = minimized and UDim2.new(0,560,0,40) or UDim2.new(0,560,0,440)
+    MinBtn.Text = minimized and "□" or "─"
+end)
+
+ClearBtn.MouseButton1Click:Connect(function()
+    history={}; remoteLogs={}; msgCount=0
+    for _,c in ipairs(ChatScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    SpyStatus.Text="Remote Spy: "..(spyActive and "ON" or "OFF").."  |  Captured: 0"
+    addMessage("system","🗑 Cleared")
+end)
+
+CloseBtn.MouseButton1Click:Connect(function()
+    stopSpy(); ScreenGui:Destroy(); _G.BloxChatGui=nil
+end)
+
+ApplyBtn.MouseButton1Click:Connect(function()
+    if KeyTb.Text~="" then CONFIG.apiKey=KeyTb.Text end
+    CONFIG.maxDexDepth = tonumber(DepthTb.Text) or 4
+    updateBadges(); SP.Visible=false
+    addMessage("system","✅ Applied: "..getProvider().name.." → "..getModel())
+end)
+
+FetchBtn.MouseButton1Click:Connect(function()
+    addMessage("system",
+        "🌐 Known free AI API sources:\n"..
+        "• text.pollinations.ai/openai — no key\n"..
+        "• api.llm7.io/v1 — no key\n"..
+        "• openrouter.ai/api/v1 — free :free models\n"..
+        "• api.kilo.ai — no card\n"..
+        "• api.groq.com — free key at groq.com\n"..
+        "• generativelanguage.googleapis.com — free key aistudio.google.com\n"..
+        "• api.deepseek.com — 5M free tokens\n"..
+        "• api.cerebras.ai — free key\n"..
+        "• open.bigmodel.cn — GLM free\n\n"..
+        "GitHub lists:\n"..
+        "github.com/mnfst/awesome-free-llm-apis\n"..
+        "github.com/ClawLabsAI/free-ai-models\n"..
+        "github.com/OuterSpacee/free-ai-apis"
+    )
+end)
+
+-- ══════════════════════════════════════════════
+-- WELCOME
+-- ══════════════════════════════════════════════
+addMessage("system",
+    "🤖 BloxChat v2.0 — Live Dex + Remote Spy\n\n"..
+    "🌲 /dex Workspace  → snapshot + AI analysis\n"..
+    "🔴 /spy            → toggle remote spy\n"..
+    "🔍 /analyze        → send captured remotes to AI\n"..
+    "❓ /help           → all commands\n\n"..
+    "Provider: "..getProvider().name.." | Model: "..getModel().."\n"..
+    "Delta/sUNC ready ✓"
+)
